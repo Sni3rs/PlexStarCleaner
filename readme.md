@@ -1,4 +1,5 @@
 # PlexStarCleaner
+![](logo.png)
 
 A scheduled Docker container that automatically cleans up watched Plex media from Sonarr and Radarr based on community user ratings.
 
