@@ -1,5 +1,6 @@
+![logo.png](https://raw.githubusercontent.com/your-github-username/plex-janitor/main/logo.png)
+
 # PlexStarCleaner
-![](logo.png)
 
 A scheduled Docker container that automatically cleans up watched Plex media from Sonarr and Radarr based on community user ratings.
 
@@ -26,15 +27,16 @@ This application is configured entirely through Docker environment variables.
 
 | Variable | Description | Example Value |
 | :--- | :--- | :--- |
+| **`PLEX_TOKEN`** | **(Required)** Your Plex authentication token. Needed to query the ratings API. See the [Plex support article](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/) on how to find it. | `YourSecretPlexToken` |
 | `TZ` | Your local timezone. [List of TZ database time zones](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones). | `Europe/Zurich` |
 | `DRY_RUN` | **`true` for testing (no deletion)**, `false` to enable deletion. **Start with `true`!** | `true` |
 | `DAYS_DELAY` | Days since last watched before media is considered for deletion. | `30` |
 | `RATING_THRESHOLD` | Media with an average user rating *below* this is deleted (e.g., 6.5 deletes 6.4 and lower). | `6.5` |
 | `CRON_SCHEDULE` | Time of day (HH:MM) in 24-hour format to run the daily job. | `02:00` |
-| **`RATING_MODE`** | **(New)** Sets the rating logic. `average` (default): deletes if the average rating is below the threshold. `any_high`: keeps the item if *any single user* has rated it at or above the threshold. | `any_high` |
-| **`SERIES_WATCH_MODE`** | **(New)** Sets the condition for series. `full` (default): processes a series only after it's fully watched. `bored`: processes a series as soon as any episode is watched, allowing early deletion of disliked shows. | `bored` |
-| `TAUTULLI_URL` | Full URL to your Tautulli server. Use the container's IP if on a custom docker network. | `http://192.168.1.50:8181` |
-| `TAUTULLI_API_KEY` | Your API key from Tautulli Settings > Web Interface > API. | `YourTautulliApiKey` |
+| `RATING_MODE` | Sets the rating logic. `average` (default): deletes if the average rating is below the threshold. `any_high`: keeps the item if *any single user* has rated it at or above the threshold. | `any_high` |
+| `SERIES_WATCH_MODE` | Sets the condition for series. `full` (default): processes a series only after it's fully watched. `bored`: processes a series as soon as any episode is watched. | `bored` |
+| `TAUTULLI_URL` | **(Required)** Full URL to your Tautulli server. | `http://192.168.1.50:8181` |
+| `TAUTULLI_API_KEY` | **(Required)** Your API key from Tautulli Settings > Web Interface > API. | `YourTautulliApiKey` |
 | `RADARR_URL` | Full URL to your Radarr server. | `http://192.168.1.50:7878` |
 | `RADARR_API_KEY` | Your API key from Radarr Settings > General > Security. | `YourRadarrApiKey` |
 | `SONARR_URL` | Full URL to your Sonarr server. | `http://192.168.1.50:8989` |
@@ -42,4 +44,4 @@ This application is configured entirely through Docker environment variables.
 
 ## Deployment
 
-This application is designed to be deployed as a Docker container. See the official guide for instructions on deploying to systems like Unraid.
+This application is designed to be deployed as a Docker container. For Unraid, use the provided template or install via Community Applications once available.
