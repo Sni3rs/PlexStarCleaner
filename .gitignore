@@ -65,3 +65,6 @@ venv.bak/
 .project
 .pydevproject
 .settings/
+
+# Local Cheatsheet
+update-cheatsheet.md

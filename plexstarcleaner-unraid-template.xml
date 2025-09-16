@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>PlexStarCleaner</Name>
+  <Repository>sni3rs/plexstarcleaner</Repository>
+  <Registry>https://hub.docker.com/r/sni3rs/plexstarcleaner</Registry>
+  <Network>bridge</Network>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/Sni3rs/PlexStarCleaner</Support>
+  <Project>https://github.com/Sni3rs/PlexStarCleaner</Project>
+  <Category>MediaApp:Tools</Category>
+  <WebUI/>
+  <TemplateURL>https://raw.githubusercontent.com/Sni3rs/PlexStarCleaner/main/plexstarcleaner-unraid-template.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/Sni3rs/PlexStarCleaner/main/logo.png</Icon>
+  <Description>A scheduled Docker container that automatically cleans up watched Plex media from Sonarr and Radarr based on community user ratings.</Description>
+  <Changes>
+    [b]2025-09-16[/b] - Initial Release
+  </Changes>
+  <Config Name="Dry Run" Target="DRY_RUN" Description="Set to 'true' to log actions without deleting files. Set to 'false' to enable deletion. HIGHLY RECOMMEND starting with 'true'." Type="Variable" Default="true"/>
+  <Config Name="Days Delay" Target="DAYS_DELAY" Description="Days since last watched before media is considered for deletion." Type="Variable" Default="30"/>
+  <Config Name="Rating Threshold" Target="RATING_THRESHOLD" Description="Media with an average user rating BELOW this value will be deleted." Type="Variable" Default="6.5"/>
+  <Config Name="Cron Schedule" Target="CRON_SCHEDULE" Description="Time of day (HH:MM) in 24-hour format to run the daily job." Type="Variable" Default="02:00"/>
+  <Config Name="Time Zone" Target="TZ" Description="Your local timezone. (e.g., America/New_York, Europe/Zurich)" Type="Variable" Default="Europe/Zurich"/>
+  <Config Name="Tautulli URL" Target="TAUTULLI_URL" Description="Full URL to your Tautulli server." Type="Variable" Default="http://192.168.1.50:8181"/>
+  <Config Name="Tautulli API Key" Target="TAUTULLI_API_KEY" Description="Your API key from Tautulli Settings." Type="Variable" Default=""/>
+  <Config Name="Radarr URL" Target="RADARR_URL" Description="Full URL to your Radarr server." Type="Variable" Default="http://192.168.1.50:7878"/>
+  <Config Name="Radarr API Key" Target="RADARR_API_KEY" Description="Your API key from Radarr Settings." Type="Variable" Default=""/>
+  <Config Name="Sonarr URL" Target="SONARR_URL" Description="Full URL to your Sonarr server." Type="Variable" Default="http://192.168.1.50:8989"/>
+  <Config Name="Sonarr API Key" Target="SONARR_API_KEY" Description="Your API key from Sonarr Settings." Type="Variable" Default=""/>
+</Container>
