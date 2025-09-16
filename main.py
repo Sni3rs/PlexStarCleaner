@@ -19,6 +19,10 @@ DRY_RUN = os.getenv('DRY_RUN', 'true').lower() == 'true'
 DAYS_DELAY = int(os.getenv('DAYS_DELAY', 30))
 RATING_THRESHOLD = float(os.getenv('RATING_THRESHOLD', 6.5))
 CRON_SCHEDULE = os.getenv('CRON_SCHEDULE', '02:00')
+# NEW: Excluded libraries setting
+EXCLUDED_LIBRARIES_STR = os.getenv('EXCLUDED_LIBRARIES', '')
+EXCLUDED_LIBRARIES = [lib.strip() for lib in EXCLUDED_LIBRARIES_STR.split(',') if lib.strip()]
+
 
 # Logic Mode Settings
 RATING_MODE = os.getenv('RATING_MODE', 'average').lower()
@@ -27,7 +31,6 @@ SERIES_WATCH_MODE = os.getenv('SERIES_WATCH_MODE', 'full').lower()
 # Plex Community GraphQL API Endpoint
 PLEX_GRAPHQL_URL = "https://metadata.provider.plex.tv/library/arts"
 
-print(f"DEBUG: PLEX_TOKEN loaded from environment: '{PLEX_TOKEN}'")
 
 def get_plex_user_ratings(guid):
     """
@@ -150,6 +153,7 @@ def delete_sonarr_series(tvdb_id):
 def process_media_item(title, guid, media_type):
     """
     Processes a single media item: fetches ratings, evaluates them, and triggers deletion if criteria are met.
+    Returns the media type ('movie' or 'series') if flagged for deletion, otherwise None.
     """
     print(f"\nProcessing {media_type.capitalize()}: {title} (GUID: {guid})")
     
@@ -157,10 +161,10 @@ def process_media_item(title, guid, media_type):
 
     if user_ratings is None:
         print("Skipping due to an error fetching ratings.")
-        return
+        return None
     if not user_ratings:
         print("No user ratings found. Skipping.")
-        return
+        return None
 
     print(f"Found {len(user_ratings)} user rating(s): {user_ratings}")
 
@@ -181,7 +185,6 @@ def process_media_item(title, guid, media_type):
             print(f"Decision: DELETE (No single rating is at or above the {RATING_THRESHOLD} threshold).")
         else:
             print(f"Decision: KEEP (At least one user rated it at or above {RATING_THRESHOLD}).")
-
     else:
         print(f"Warning: Unknown RATING_MODE '{RATING_MODE}'. Defaulting to 'average' behavior.")
         average_rating = sum(user_ratings) / len(user_ratings)
@@ -191,25 +194,32 @@ def process_media_item(title, guid, media_type):
     if should_delete:
         try:
             db_id = guid.split('/')[-1].split('?')[0]
-            if 'tvdb' in guid:
+            if media_type == 'series':
                 delete_sonarr_series(db_id)
-            elif 'tmdb' in guid:
+            elif media_type == 'movie':
                 delete_radarr_movie(db_id)
-            else:
-                print(f"Warning: Could not determine service (Sonarr/Radarr) from GUID: {guid}")
+            
+            return media_type # Return type if deletion was triggered
         except IndexError:
             print(f"Error: Could not parse database ID from GUID: {guid}")
+    
+    return None
 
 def run_cleanup_job():
     """
     Main job function: Fetches watch history from Tautulli and processes eligible media.
     """
-    print("\n" + "="*50)
+    print("\n" + "="*80)
     print(f"Starting PlexStarCleaner Job at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Mode: {'DRY RUN' if DRY_RUN else 'LIVE DELETION'}")
-    print(f"Rating Mode: {RATING_MODE.upper()}")
-    print(f"Series Watch Mode: {SERIES_WATCH_MODE.upper()}")
-    print("="*50 + "\n")
+    if EXCLUDED_LIBRARIES:
+        print(f"Excluding libraries: {', '.join(EXCLUDED_LIBRARIES)}")
+    print("="*80 + "\n")
+
+    # --- NEW: Initialize counters for the summary
+    movies_flagged = 0
+    series_flagged = 0
+    total_processed = 0
 
     required_vars = ['TAUTULLI_URL', 'TAUTULLI_API_KEY', 'PLEX_TOKEN']
     missing_vars = [var for var in required_vars if not globals().get(var)]
@@ -233,6 +243,10 @@ def run_cleanup_job():
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=DAYS_DELAY)
 
     for item in history_data:
+        # --- NEW: Library exclusion check
+        if item.get('library_name') in EXCLUDED_LIBRARIES:
+            continue
+
         if item.get('media_type') not in ['movie', 'episode'] or not item.get('guid'):
             continue
         
@@ -258,16 +272,31 @@ def run_cleanup_job():
     
     if not media_to_process:
         print("No eligible media items found to process.")
-        return
-
-    print(f"Found {len(media_to_process)} unique media items eligible for processing.")
+    else:
+        print(f"Found {len(media_to_process)} unique media items eligible for processing.")
+        sorted_media = sorted(media_to_process.values(), key=lambda x: x['last_watched'])
+        total_processed = len(sorted_media)
+        
+        for media in sorted_media:
+            result = process_media_item(title=media['title'], guid=media['guid'], media_type=media['media_type'])
+            if result == 'movie':
+                movies_flagged += 1
+            elif result == 'series':
+                series_flagged += 1
     
-    sorted_media = sorted(media_to_process.values(), key=lambda x: x['last_watched'])
-    
-    for media in sorted_media:
-        process_media_item(title=media['title'], guid=media['guid'], media_type=media['media_type'])
-    
-    print("\n" + "="*50 + f"\nPlexStarCleaner Job Finished at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n" + "="*50)
+    # --- NEW: Final Summary
+    print("\n" + "="*80)
+    print("PlexStarCleaner Job Finished")
+    print(f"Execution Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("-" * 30)
+    print("S U M M A R Y")
+    print("-" * 30)
+    print(f"Total Unique Media Processed: {total_processed}")
+    action = "would have been deleted" if DRY_RUN else "were deleted"
+    print(f"Movies flagged for deletion: {movies_flagged}")
+    print(f"Series flagged for deletion: {series_flagged}")
+    print(f"Total items that {action}: {movies_flagged + series_flagged}")
+    print("="*80)
 
 if __name__ == "__main__":
     run_cleanup_job()

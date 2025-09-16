@@ -17,19 +17,25 @@
     [b]2025-09-16[/b] - Added required PLEX_TOKEN for API authentication.
     [b]2023-10-28[/b] - Added RATING_MODE and SERIES_WATCH_MODE for flexible deletion logic.
     [b]2023-10-27[/b] - Initial Release
-  </Changes>
-  <Config Name="Plex Token" Target="PLEX_TOKEN" Description="[REQUIRED] Your X-Plex-Token for API authentication. See Plex support articles for how to find this." Type="Variable" Default="" Mask="true"/>
+</Changes>
+  <!-- App Settings -->
   <Config Name="Dry Run" Target="DRY_RUN" Description="Set to 'true' to log actions without deleting files. Set to 'false' to enable deletion." Type="Variable" Default="true"/>
+  <Config Name="Excluded Libraries" Target="EXCLUDED_LIBRARIES" Description="(Optional) Comma-separated list of Plex libraries to ignore (e.g., eLearning,Home Videos)." Type="Variable" Default=""/>
   <Config Name="Rating Mode" Target="RATING_MODE" Description="[average]: Delete if average rating is too low. [any_high]: Keep if ANY user rates it high enough." Type="Variable" Default="average"/>
   <Config Name="Series Watch Mode" Target="SERIES_WATCH_MODE" Description="[full]: Process series only when fully watched. [bored]: Process series after any episode is watched." Type="Variable" Default="full"/>
   <Config Name="Days Delay" Target="DAYS_DELAY" Description="Days since last watched before media is considered for deletion." Type="Variable" Default="30"/>
   <Config Name="Rating Threshold" Target="RATING_THRESHOLD" Description="Media with a rating BELOW this value will be deleted." Type="Variable" Default="6.5"/>
   <Config Name="Cron Schedule" Target="CRON_SCHEDULE" Description="Time of day (HH:MM) in 24-hour format to run the daily job." Type="Variable" Default="02:00"/>
   <Config Name="Time Zone" Target="TZ" Description="Your local timezone. (e.g., America/New_York, Europe/Zurich)" Type="Variable" Default="Europe/Zurich"/>
-  <Config Name="Tautulli URL" Target="TAUTULLI_URL" Description="Full URL to your Tautulli server." Type="Variable" Default="http://192.168.1.50:8181"/>
-  <Config Name="Tautulli API Key" Target="TAUTULLI_API_KEY" Description="Your API key from Tautulli Settings." Type="Variable" Default=""/>
-  <Config Name="Radarr URL" Target="RADARR_URL" Description="Full URL to your Radarr server." Type="Variable" Default="http://192.168.1.50:7878"/>
-  <Config Name="Radarr API Key" Target="RADARR_API_KEY" Description="Your API key from Radarr Settings." Type="Variable" Default=""/>
-  <Config Name="Sonarr URL" Target="SONARR_URL" Description="Full URL to your Sonarr server." Type="Variable" Default="http://192.168.1.50:8989"/>
-  <Config Name="Sonarr API Key" Target="SONARR_API_KEY" Description="Your API key from Sonarr Settings." Type="Variable" Default=""/>
+  <!-- Plex Configuration -->
+  <Config Name="Plex Token" Target="PLEX_TOKEN" Description="[REQUIRED] Your X-Plex-Token for API authentication." Type="Variable" Default="" Required="true" Mask="true"/>
+  <!-- Tautulli Configuration -->
+  <Config Name="Tautulli URL" Target="TAUTULLI_URL" Description="[REQUIRED] Full URL to your Tautulli server." Type="Variable" Default="" Required="true"/>
+  <Config Name="Tautulli API Key" Target="TAUTULLI_API_KEY" Description="[REQUIRED] Your API key from Tautulli Settings." Type="Variable" Default="" Required="true" Mask="true"/>
+  <!-- Radarr Configuration -->
+  <Config Name="Radarr URL" Target="RADARR_URL" Description="(Optional) Full URL to your Radarr server." Type="Variable" Default="" Required="false"/>
+  <Config Name="Radarr API Key" Target="RADARR_API_KEY" Description="(Optional) Your API key from Radarr Settings." Type="Variable" Default="" Required="false" Mask="true"/>
+  <!-- Sonarr Configuration -->
+  <Config Name="Sonarr URL" Target="SONARR_URL" Description="(Optional) Full URL to your Sonarr server." Type="Variable" Default="" Required="false"/>
+  <Config Name="Sonarr API Key" Target="SONARR_API_KEY" Description="(Optional) Your API key from Sonarr Settings." Type="Variable" Default="" Required="false" Mask="true"/>
 </Container>

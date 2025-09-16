@@ -18,6 +18,7 @@ The script runs on a schedule and performs the following actions:
 -   **Immediate & Scheduled Execution**: Runs once on container start-up and then daily on a schedule.
 -   **Safe Dry Run Mode**: A `DRY_RUN` mode logs all actions it *would* take without deleting any files, perfect for initial setup and testing.
 -   **Flexible Logic**: Configure how ratings are evaluated and when series become eligible for deletion.
+-   **Library Exclusion**: Ignore specific Plex libraries (e.g., for documentaries, kids shows, etc.).
 -   **Rating Based**: Deletes media based on the average of actual user ratings, not the generic public score.
 -   **Lightweight**: Built on a slim Python image for a small footprint.
 
@@ -28,6 +29,7 @@ This application is configured entirely through Docker environment variables.
 | Variable | Description | Example Value |
 | :--- | :--- | :--- |
 | **`PLEX_TOKEN`** | **(Required)** Your Plex authentication token. Needed to query the ratings API. See the [Plex support article](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/) on how to find it. | `YourSecretPlexToken` |
+| **`EXCLUDED_LIBRARIES`** | Comma-separated list of Plex library names to ignore. Case-sensitive. | `eLearning,Home Videos` |
 | `TZ` | Your local timezone. [List of TZ database time zones](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones). | `Europe/Zurich` |
 | `DRY_RUN` | **`true` for testing (no deletion)**, `false` to enable deletion. **Start with `true`!** | `true` |
 | `DAYS_DELAY` | Days since last watched before media is considered for deletion. | `30` |
