@@ -5,9 +5,9 @@ FROM python:3.11-slim-bullseye
 # Set the timezone to prevent scheduling issues
 ENV TZ=Etc/UTC
 # Prevents Python from writing pyc files to disc
-ENV PYTHONDONTWRITEBYTECODE 1
+ENV PYTHONDONTWRITEBYTECODE=1
 # Prevents Python from buffering stdout and stderr
-ENV PYTHONUNBUFFERED 1
+ENV PYTHONUNBUFFERED=1
 
 # Set the working directory in the container
 WORKDIR /app
@@ -21,3 +21,4 @@ COPY main.py .
 
 # Command to run the application
 CMD ["python", "main.py"]
+
