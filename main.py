@@ -27,6 +27,7 @@ SERIES_WATCH_MODE = os.getenv('SERIES_WATCH_MODE', 'full').lower()
 # Plex Community GraphQL API Endpoint
 PLEX_GRAPHQL_URL = "https://metadata.provider.plex.tv/library/arts"
 
+print(f"DEBUG: PLEX_TOKEN loaded from environment: '{PLEX_TOKEN}'")
 
 def get_plex_user_ratings(guid):
     """
