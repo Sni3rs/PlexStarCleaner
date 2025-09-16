@@ -19,9 +19,8 @@ DRY_RUN = os.getenv('DRY_RUN', 'true').lower() == 'true'
 DAYS_DELAY = int(os.getenv('DAYS_DELAY', 30))
 RATING_THRESHOLD = float(os.getenv('RATING_THRESHOLD', 6.5))
 CRON_SCHEDULE = os.getenv('CRON_SCHEDULE', '02:00')
-# NEW: Excluded libraries setting
 EXCLUDED_LIBRARIES_STR = os.getenv('EXCLUDED_LIBRARIES', '')
-EXCLUDED_LIBRARIES = [lib.strip() for lib in EXCLUDED_LIBRARIES_STR.split(',') if lib.strip()]
+EXCLUDED_LIBRARIES = [lib.strip().lower() for lib in EXCLUDED_LIBRARIES_STR.split(',') if lib.strip()]
 
 
 # Logic Mode Settings
@@ -45,19 +44,38 @@ def get_plex_user_ratings(guid):
         'Accept': 'application/json',
         'X-Plex-Token': PLEX_TOKEN,
     }
+
+    # MODIFIED: Using the new, more direct ActivityFeed query
     query = """
-    query GetUserReviews($guid: String!) {
-      media(guid: $guid) {
-        ... on Movie {
-          userReviews(first: 500) { nodes { rating user { title } } }
-        }
-        ... on Show {
-          userReviews(first: 500) { nodes { rating user { title } } }
+    query GetActivityFeed($metadataID: ID!) {
+      activityFeed(
+        first: 100
+        types: [RATING, WATCH_RATING]
+        includeDescendants: true
+        metadataID: $metadataID
+      ) {
+        nodes {
+          ... on ActivityRating {
+            rating
+          }
+          ... on ActivityWatchRating {
+            rating
+          }
         }
       }
     }
     """
-    variables = {'guid': guid}
+    try:
+        # MODIFIED: Extract the metadata ID from the full GUID
+        # e.g., "plex://movie/5d776c7f594b2b001e6f534d" -> "5d776c7f594b2b001e6f534d"
+        metadata_id = guid.split('/')[-1]
+    except IndexError:
+        print(f"Error: Could not parse metadata ID from GUID: {guid}")
+        return None
+    
+    # MODIFIED: Updated variables to match the new query
+    variables = {'metadataID': metadata_id}
+    
     try:
         response = requests.post(
             PLEX_GRAPHQL_URL,
@@ -66,11 +84,13 @@ def get_plex_user_ratings(guid):
             timeout=20
         )
         response.raise_for_status()
-        data = response.json().get('data', {}).get('media', {})
-        if not data or not data.get('userReviews') or not data['userReviews'].get('nodes'):
+        data = response.json().get('data', {}).get('activityFeed', {})
+        
+        if not data or not data.get('nodes'):
             return []
         
-        ratings = [node['rating'] * 2 for node in data['userReviews']['nodes'] if node.get('rating') is not None]
+        # MODIFIED: Rating is now directly on a 10-point scale, no multiplication needed
+        ratings = [node['rating'] for node in data['nodes'] if node.get('rating') is not None]
         return ratings
     except requests.exceptions.RequestException as e:
         print(f"Error querying Plex GQL API for GUID {guid}: {e}")
@@ -157,6 +177,11 @@ def process_media_item(title, guid, media_type):
     """
     print(f"\nProcessing {media_type.capitalize()}: {title} (GUID: {guid})")
     
+    # GUID from Tautulli can sometimes contain agent info, which the GQL API dislikes.
+    # We clean it to the base "plex://..." format.
+    if '?' in guid:
+        guid = guid.split('?')[0]
+        
     user_ratings = get_plex_user_ratings(guid)
 
     if user_ratings is None:
@@ -193,11 +218,17 @@ def process_media_item(title, guid, media_type):
 
     if should_delete:
         try:
-            db_id = guid.split('/')[-1].split('?')[0]
-            if media_type == 'series':
+            # For deletion, we need the DB-specific ID (e.g., tmdb12345)
+            # which is different from the Plex metadata ID. Tautulli's GUID is best.
+            if 'tvdb' in guid:
+                db_id = guid.split('//')[-1]
                 delete_sonarr_series(db_id)
-            elif media_type == 'movie':
+            elif 'tmdb' in guid:
+                db_id = guid.split('//')[-1]
                 delete_radarr_movie(db_id)
+            else:
+                 print(f"Warning: Could not determine service (Sonarr/Radarr) from GUID: {guid}")
+                 return None
             
             return media_type # Return type if deletion was triggered
         except IndexError:
@@ -213,10 +244,9 @@ def run_cleanup_job():
     print(f"Starting PlexStarCleaner Job at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Mode: {'DRY RUN' if DRY_RUN else 'LIVE DELETION'}")
     if EXCLUDED_LIBRARIES:
-        print(f"Excluding libraries: {', '.join(EXCLUDED_LIBRARIES)}")
+        print(f"Excluding libraries (case-insensitive): {', '.join(EXCLUDED_LIBRARIES)}")
     print("="*80 + "\n")
 
-    # --- NEW: Initialize counters for the summary
     movies_flagged = 0
     series_flagged = 0
     total_processed = 0
@@ -243,8 +273,7 @@ def run_cleanup_job():
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=DAYS_DELAY)
 
     for item in history_data:
-        # --- NEW: Library exclusion check
-        if item.get('library_name') in EXCLUDED_LIBRARIES:
+        if item.get('library_name', '').lower() in EXCLUDED_LIBRARIES:
             continue
 
         if item.get('media_type') not in ['movie', 'episode'] or not item.get('guid'):
@@ -284,7 +313,6 @@ def run_cleanup_job():
             elif result == 'series':
                 series_flagged += 1
     
-    # --- NEW: Final Summary
     print("\n" + "="*80)
     print("PlexStarCleaner Job Finished")
     print(f"Execution Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
