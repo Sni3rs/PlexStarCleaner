@@ -80,12 +80,12 @@ def evaluate_ratings(ratings):
     
     if RATING_MODE == 'any_high':
         if any(r >= RATING_THRESHOLD for r in ratings):
-            return False, f"Kept because one rating is >= {RATING_THRESHOLD}", average_rating
+            return False, f"Kept: one rating is >= {RATING_THRESHOLD}", average_rating
     
     if average_rating < RATING_THRESHOLD:
-        return True, f"Eligible for deletion (Average Rating: {average_rating:.1f})", average_rating
+        return True, f"Eligible: Average Rating ({average_rating:.1f}) is below {RATING_THRESHOLD}", average_rating
     
-    return False, f"Kept (Average Rating: {average_rating:.1f})", average_rating
+    return False, f"Kept: Average Rating ({average_rating:.1f}) is >= {RATING_THRESHOLD}", average_rating
 
 def is_series_fully_watched(series_item):
     """Checks if a series has been fully watched."""
@@ -155,10 +155,8 @@ def run_cleanup_job():
     # --- Service Connection ---
     try:
         plex_server = PlexServer(PLEX_URL, PLEX_TOKEN)
-        print("Successfully connected to Plex server.")
     except Exception as e:
-        print(f"Fatal: Could not connect to Plex server. Aborting. Error: {e}")
-        return
+        print(f"Fatal: Could not connect to Plex server. Aborting. Error: {e}"); return
 
     try:
         print("Fetching Tautulli history...")
@@ -168,35 +166,28 @@ def run_cleanup_job():
         history_data = response.json()['response']['data']['data']
         print(f"Found {len(history_data)} items in Tautulli history.")
     except Exception as e:
-        print(f"Fatal: Could not fetch Tautulli history. Aborting. Error: {e}")
-        return
+        print(f"Fatal: Could not fetch Tautulli history. Aborting. Error: {e}"); return
 
     # --- Data Aggregation from Tautulli ---
     media_data = {}
     for item in history_data:
         if item.get('library_name', '').lower() in EXCLUDED_LIBRARIES: continue
-        
         rating_key = item.get('grandparent_rating_key') if item.get('media_type') == 'episode' else item.get('rating_key')
         title = item.get('grandparent_title') if item.get('media_type') == 'episode' else item.get('full_title')
         user = item.get('friendly_name', 'Unknown')
         user_rating = item.get('user_rating')
-        
         if not rating_key or not title: continue
-        
         last_watched_date = datetime.fromtimestamp(item.get('date', 0), timezone.utc)
-        
         if rating_key not in media_data:
             media_data[rating_key] = {'ratings': [], 'users': set(), 'last_watched': last_watched_date, 'title': title}
-        
         if user_rating is not None:
             media_data[rating_key]['ratings'].append(float(user_rating))
-        
         media_data[rating_key]['users'].add(user)
         if last_watched_date > media_data[rating_key]['last_watched']:
             media_data[rating_key]['last_watched'] = last_watched_date
     
-    print(f"Aggregated history into {len(media_data)} unique media items.")
-    
+    print(f"Aggregated history into {len(media_data)} unique media items. Now processing...")
+
     # --- Processing Logic ---
     items_for_warning, items_for_deletion = [], []
     now = datetime.now(timezone.utc)
@@ -204,22 +195,36 @@ def run_cleanup_job():
     warning_end = now - timedelta(days=DAYS_DELAY_WARNING)
     deletion_cutoff = now - timedelta(days=DAYS_DELAY_DELETION)
 
-    for key, data in media_data.items():
+    for i, (key, data) in enumerate(media_data.items()):
+        print(f"\n[{i+1}/{len(media_data)}] Processing '{data['title']}'")
+        last_watched_ago = (now - data['last_watched']).days
+        print(f"  - Last watched: {last_watched_ago} days ago.")
+
+        if last_watched_ago < DAYS_DELAY_WARNING:
+            print(f"  - SKIP: Watched too recently.")
+            continue
+
         plex_item, db_id, db_type = get_plex_item_details(plex_server, key)
-        if not plex_item: continue
+        if not plex_item:
+            print("  - SKIP: Item not found on Plex server.")
+            continue
 
         should_delete, reason, avg_rating = evaluate_ratings(data['ratings'])
-        if not should_delete: continue
+        print(f"  - Ratings: {data['ratings'] if data['ratings'] else 'None'}. Evaluation: {reason}")
+        if not should_delete:
+            continue
 
         if db_type == 'series' and SERIES_WATCH_MODE == 'full' and not is_series_fully_watched(plex_item):
-            print(f"Skipping '{data['title']}': Not fully watched (mode: full).")
+            print(f"  - SKIP: Series not fully watched (mode: full).")
             continue
 
         if warning_start < data['last_watched'] <= warning_end:
+            print(f"  - QUALIFIES FOR WARNING.")
             items_for_warning.append({'title': data['title'], 'avg_rating': avg_rating, 'users': data['users']})
         elif data['last_watched'] < deletion_cutoff:
+            print(f"  - QUALIFIES FOR DELETION.")
             items_for_deletion.append({'db_id': db_id, 'db_type': db_type, 'title': data['title'], 'avg_rating': avg_rating})
-    
+
     # --- Actions and Notifications ---
     if items_for_warning:
         subject = f"Plex Deletion Warning: {len(items_for_warning)} Item(s)"
@@ -240,8 +245,7 @@ def run_cleanup_job():
                 deleted = delete_radarr_movie(item_data['db_id'])
             elif item_data['db_type'] == 'series':
                 deleted = delete_sonarr_series(item_data['db_id'])
-            if deleted:
-                actions_taken.append(item_data)
+            if deleted: actions_taken.append(item_data)
 
     if actions_taken:
         action_verb = "Flagged for Deletion" if DRY_RUN else "Deleted"
@@ -252,7 +256,7 @@ def run_cleanup_job():
         print("\n--- DELETION SUMMARY ---")
         print(body.replace('<b>', '').replace('</b>', ''))
         send_tautulli_notification(subject, body)
-    
+
     if not items_for_warning and not actions_taken:
         print("\nNo items matched the criteria for warning or deletion.")
 
@@ -261,7 +265,6 @@ def run_cleanup_job():
 if __name__ == "__main__":
     if DAYS_DELAY_WARNING >= DAYS_DELAY_DELETION:
         raise ValueError("FATAL: DAYS_DELAY_DELETION must be greater than DAYS_DELAY_WARNING.")
-    
     run_cleanup_job()
     schedule.every().day.at(CRON_SCHEDULE).do(run_cleanup_job)
     print(f"Scheduling job to run every day at {CRON_SCHEDULE}. Waiting...")
