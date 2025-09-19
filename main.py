@@ -3,6 +3,7 @@ import requests
 import schedule
 import time
 from datetime import datetime, timedelta, timezone
+from plexapi.server import PlexServer
 
 # --- Environment Variables ---
 # Service Configurations
@@ -12,6 +13,7 @@ RADARR_URL = os.getenv('RADARR_URL')
 RADARR_API_KEY = os.getenv('RADARR_API_KEY')
 SONARR_URL = os.getenv('SONARR_URL')
 SONARR_API_KEY = os.getenv('SONARR_API_KEY')
+PLEX_URL = os.getenv('PLEX_URL')
 PLEX_TOKEN = os.getenv('PLEX_TOKEN')
 
 # Script Settings
@@ -22,78 +24,23 @@ CRON_SCHEDULE = os.getenv('CRON_SCHEDULE', '02:00')
 EXCLUDED_LIBRARIES_STR = os.getenv('EXCLUDED_LIBRARIES', '')
 EXCLUDED_LIBRARIES = [lib.strip().lower() for lib in EXCLUDED_LIBRARIES_STR.split(',') if lib.strip()]
 
-
 # Logic Mode Settings
+# Note: RATING_MODE is kept for compatibility, but now only reflects the owner's rating.
+# 'average' and 'any_high' will behave identically as we fetch a single rating.
 RATING_MODE = os.getenv('RATING_MODE', 'average').lower()
 SERIES_WATCH_MODE = os.getenv('SERIES_WATCH_MODE', 'full').lower()
 
-# Plex Community GraphQL API Endpoint
-PLEX_GRAPHQL_URL = "https://metadata.provider.plex.tv/graphql"
 
-
-def get_plex_user_ratings(guid):
+def get_owner_rating(plex_server, rating_key):
     """
-    Queries the Plex Community GraphQL API to get individual user ratings for a media item.
-    """
-    if not PLEX_TOKEN:
-        print("Error: PLEX_TOKEN is not set. Cannot query the Plex API.")
-        return None
-
-    headers = {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'X-Plex-Token': PLEX_TOKEN,
-    }
-
-    # MODIFIED: Using the new, more direct ActivityFeed query
-    query = """
-    query GetActivityFeed($metadataID: ID!) {
-      activityFeed(
-        first: 100
-        types: [RATING, WATCH_RATING]
-        includeDescendants: true
-        metadataID: $metadataID
-      ) {
-        nodes {
-          ... on ActivityRating {
-            rating
-          }
-          ... on ActivityWatchRating {
-            rating
-          }
-        }
-      }
-    }
+    Fetches the personal rating for a media item from the Plex server.
     """
     try:
-        # MODIFIED: Extract the metadata ID from the full GUID
-        # e.g., "plex://movie/5d776c7f594b2b001e6f534d" -> "5d776c7f594b2b001e6f534d"
-        metadata_id = guid.split('/')[-1]
-    except IndexError:
-        print(f"Error: Could not parse metadata ID from GUID: {guid}")
-        return None
-    
-    # MODIFIED: Updated variables to match the new query
-    variables = {'metadataID': metadata_id}
-    
-    try:
-        response = requests.post(
-            PLEX_GRAPHQL_URL,
-            headers=headers,
-            json={'query': query, 'variables': variables},
-            timeout=20
-        )
-        response.raise_for_status()
-        data = response.json().get('data', {}).get('activityFeed', {})
-        
-        if not data or not data.get('nodes'):
-            return []
-        
-        # MODIFIED: Rating is now directly on a 10-point scale, no multiplication needed
-        ratings = [node['rating'] for node in data['nodes'] if node.get('rating') is not None]
-        return ratings
-    except requests.exceptions.RequestException as e:
-        print(f"Error querying Plex GQL API for GUID {guid}: {e}")
+        item = plex_server.fetchItem(int(rating_key))
+        # userRating is on a 10-point scale
+        return item.userRating if hasattr(item, 'userRating') else None
+    except Exception as e:
+        print(f"Error fetching rating for rating_key {rating_key} from Plex: {e}")
         return None
 
 def delete_radarr_movie(tmdb_id):
@@ -105,6 +52,7 @@ def delete_radarr_movie(tmdb_id):
         return
         
     try:
+        # Radarr's API uses tmdbId as a query param, not part of the path
         lookup_response = requests.get(
             f"{RADARR_URL}/api/v3/movie",
             params={'tmdbId': tmdb_id},
@@ -142,6 +90,7 @@ def delete_sonarr_series(tvdb_id):
         return
 
     try:
+        # Sonarr's API uses tvdbId as a query param
         lookup_response = requests.get(
             f"{SONARR_URL}/api/v3/series",
             params={'tvdbId': tvdb_id},
@@ -170,61 +119,36 @@ def delete_sonarr_series(tvdb_id):
     except requests.exceptions.RequestException as e:
         print(f"Error communicating with Sonarr for TVDB ID {tvdb_id}: {e}")
 
-def process_media_item(title, guid, media_type):
+def process_media_item(plex_server, title, guid, rating_key, media_type):
     """
-    Processes a single media item: fetches ratings, evaluates them, and triggers deletion if criteria are met.
+    Processes a single media item: fetches rating, evaluates it, and triggers deletion if criteria are met.
     Returns the media type ('movie' or 'series') if flagged for deletion, otherwise None.
     """
-    print(f"\nProcessing {media_type.capitalize()}: {title} (GUID: {guid})")
+    print(f"\nProcessing {media_type.capitalize()}: {title} (Rating Key: {rating_key})")
     
-    # GUID from Tautulli can sometimes contain agent info, which the GQL API dislikes.
-    # We clean it to the base "plex://..." format.
-    if '?' in guid:
-        guid = guid.split('?')[0]
-        
-    user_ratings = get_plex_user_ratings(guid)
+    rating = get_owner_rating(plex_server, rating_key)
 
-    if user_ratings is None:
-        print("Skipping due to an error fetching ratings.")
-        return None
-    if not user_ratings:
-        print("No user ratings found. Skipping.")
+    if rating is None:
+        print("No personal rating found. Skipping.")
         return None
 
-    print(f"Found {len(user_ratings)} user rating(s): {user_ratings}")
+    print(f"Found personal rating: {rating}. Threshold is {RATING_THRESHOLD}.")
 
     should_delete = False
-    if RATING_MODE == 'average':
-        average_rating = sum(user_ratings) / len(user_ratings)
-        print(f"Average user rating is {average_rating:.2f}. Threshold is {RATING_THRESHOLD}.")
-        if average_rating < RATING_THRESHOLD:
-            should_delete = True
-            print("Decision: DELETE (Average rating is below threshold).")
-        else:
-            print("Decision: KEEP (Average rating is at or above threshold).")
-    
-    elif RATING_MODE == 'any_high':
-        is_kept_by_a_rating = any(r >= RATING_THRESHOLD for r in user_ratings)
-        if not is_kept_by_a_rating:
-            should_delete = True
-            print(f"Decision: DELETE (No single rating is at or above the {RATING_THRESHOLD} threshold).")
-        else:
-            print(f"Decision: KEEP (At least one user rated it at or above {RATING_THRESHOLD}).")
+    if rating < RATING_THRESHOLD:
+        should_delete = True
+        print(f"Decision: DELETE (Rating {rating} is below threshold {RATING_THRESHOLD}).")
     else:
-        print(f"Warning: Unknown RATING_MODE '{RATING_MODE}'. Defaulting to 'average' behavior.")
-        average_rating = sum(user_ratings) / len(user_ratings)
-        if average_rating < RATING_THRESHOLD:
-            should_delete = True
-
+        print(f"Decision: KEEP (Rating {rating} is at or above threshold {RATING_THRESHOLD}).")
+    
     if should_delete:
         try:
-            # For deletion, we need the DB-specific ID (e.g., tmdb12345)
-            # which is different from the Plex metadata ID. Tautulli's GUID is best.
+            # For deletion, we need the DB-specific ID from the GUID (e.g., tmdb, tvdb)
             if 'tvdb' in guid:
-                db_id = guid.split('//')[-1]
+                db_id = guid.split('//')[-1].split('?')[0]
                 delete_sonarr_series(db_id)
             elif 'tmdb' in guid:
-                db_id = guid.split('//')[-1]
+                db_id = guid.split('//')[-1].split('?')[0]
                 delete_radarr_movie(db_id)
             else:
                  print(f"Warning: Could not determine service (Sonarr/Radarr) from GUID: {guid}")
@@ -251,10 +175,18 @@ def run_cleanup_job():
     series_flagged = 0
     total_processed = 0
 
-    required_vars = ['TAUTULLI_URL', 'TAUTULLI_API_KEY', 'PLEX_TOKEN']
+    required_vars = ['TAUTULLI_URL', 'TAUTULLI_API_KEY', 'PLEX_URL', 'PLEX_TOKEN']
     missing_vars = [var for var in required_vars if not globals().get(var)]
     if missing_vars:
         print(f"Error: Missing required environment variables: {', '.join(missing_vars)}. Aborting job.")
+        return
+
+    try:
+        print("Connecting to Plex server...")
+        plex_server = PlexServer(PLEX_URL, PLEX_TOKEN)
+        print("Plex server connection successful.")
+    except Exception as e:
+        print(f"Error connecting to Plex server at {PLEX_URL}: {e}")
         return
 
     try:
@@ -284,30 +216,59 @@ def run_cleanup_job():
         if last_watched_date > cutoff_date:
             continue
         
-        unique_id, title, media_type, guid = None, None, None, None
+        # Use a unique key for each item
+        unique_id, title, media_type, guid, rating_key = None, None, None, None, None
 
         if item['media_type'] == 'movie' and item.get('watched_status') == 1:
-            unique_id, title, media_type, guid = item.get('rating_key'), item.get('full_title'), 'movie', item.get('guid')
+            rating_key = item.get('rating_key')
+            title = item.get('full_title')
+            media_type = 'movie'
+            guid = item.get('guid')
+            unique_id = rating_key
+
         elif item['media_type'] == 'episode':
-            unique_id, title, media_type, guid = item.get('grandparent_rating_key'), item.get('grandparent_title'), 'series', item.get('grandparent_guid')
+            # For series, we act on the show level
+            rating_key = item.get('grandparent_rating_key')
+            title = item.get('grandparent_title')
+            media_type = 'series'
+            guid = item.get('grandparent_guid')
+            unique_id = rating_key
+            # Ensure series is fully watched if mode is 'full'
             if SERIES_WATCH_MODE == 'full' and item.get('watched_status') != 1:
+                # This logic is imperfect as it only checks the last watched episode.
+                # A more robust solution would check the series' watched status in Plex,
+                # but this maintains original script behavior for simplicity.
                 continue
 
-        if not all([unique_id, title, media_type, guid]):
+        if not all([unique_id, title, media_type, guid, rating_key]):
             continue
-
+            
+        # Store the most recently watched item's data
         if unique_id not in media_to_process or last_watched_date > media_to_process[unique_id]['last_watched']:
-            media_to_process[unique_id] = {'title': title, 'guid': guid, 'media_type': media_type, 'last_watched': last_watched_date}
+            media_to_process[unique_id] = {
+                'title': title, 
+                'guid': guid, 
+                'media_type': media_type, 
+                'rating_key': rating_key, 
+                'last_watched': last_watched_date
+            }
     
     if not media_to_process:
         print("No eligible media items found to process.")
     else:
         print(f"Found {len(media_to_process)} unique media items eligible for processing.")
+        # Sort by last watched date to process oldest first
         sorted_media = sorted(media_to_process.values(), key=lambda x: x['last_watched'])
         total_processed = len(sorted_media)
         
         for media in sorted_media:
-            result = process_media_item(title=media['title'], guid=media['guid'], media_type=media['media_type'])
+            result = process_media_item(
+                plex_server=plex_server,
+                title=media['title'], 
+                guid=media['guid'], 
+                rating_key=media['rating_key'],
+                media_type=media['media_type']
+            )
             if result == 'movie':
                 movies_flagged += 1
             elif result == 'series':
@@ -326,6 +287,7 @@ def run_cleanup_job():
     print(f"Total items that {action}: {movies_flagged + series_flagged}")
     print("="*80)
 
+
 if __name__ == "__main__":
     run_cleanup_job()
     schedule.every().day.at(CRON_SCHEDULE).do(run_cleanup_job)
@@ -333,4 +295,3 @@ if __name__ == "__main__":
     while True:
         schedule.run_pending()
         time.sleep(60)
-
