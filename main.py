@@ -112,7 +112,7 @@ def delete_radarr_movie(tmdb_id):
             return True
 
         print(f"Instructing Radarr to delete movie '{movies[0]['title']}' (Radarr ID: {radarr_id})")
-        delete_response = requests.delete(f"{RADARR_URL}/api/v3/movie/{radarr_id}", params={'deleteFiles': 'true'}, headers={'X-Api-Key': RADARR_API_KEY}, timeout=30)
+        delete_response = requests.delete(f"{RADARR_URL}/api/v3/movie/{radarr_id}", params={'deleteFiles': 'true', 'addImportExclusion': 'false'}, headers={'X-Api-Key': RADARR_API_KEY}, timeout=30)
         delete_response.raise_for_status()
         return True
     except requests.exceptions.RequestException as e:
@@ -155,15 +155,18 @@ def run_cleanup_job():
     # --- Service Connection ---
     try:
         plex_server = PlexServer(PLEX_URL, PLEX_TOKEN)
+        print("Successfully connected to Plex server.")
     except Exception as e:
         print(f"Fatal: Could not connect to Plex server. Aborting. Error: {e}")
         return
 
     try:
+        print("Fetching Tautulli history...")
         params = {'apikey': TAUTULLI_API_KEY, 'cmd': 'get_history', 'length': 10000}
         response = requests.get(f"{TAUTULLI_URL}/api/v2", params=params, timeout=60)
         response.raise_for_status()
         history_data = response.json()['response']['data']['data']
+        print(f"Found {len(history_data)} items in Tautulli history.")
     except Exception as e:
         print(f"Fatal: Could not fetch Tautulli history. Aborting. Error: {e}")
         return
@@ -186,12 +189,13 @@ def run_cleanup_job():
             media_data[rating_key] = {'ratings': [], 'users': set(), 'last_watched': last_watched_date, 'title': title}
         
         if user_rating is not None:
-            # Tautulli gives ratings on a 10-point scale.
             media_data[rating_key]['ratings'].append(float(user_rating))
         
         media_data[rating_key]['users'].add(user)
         if last_watched_date > media_data[rating_key]['last_watched']:
             media_data[rating_key]['last_watched'] = last_watched_date
+    
+    print(f"Aggregated history into {len(media_data)} unique media items.")
     
     # --- Processing Logic ---
     items_for_warning, items_for_deletion = [], []
@@ -248,6 +252,9 @@ def run_cleanup_job():
         print("\n--- DELETION SUMMARY ---")
         print(body.replace('<b>', '').replace('</b>', ''))
         send_tautulli_notification(subject, body)
+    
+    if not items_for_warning and not actions_taken:
+        print("\nNo items matched the criteria for warning or deletion.")
 
     print(f"\nJob finished at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{'='*80}")
 
