@@ -28,7 +28,7 @@ RATING_MODE = os.getenv('RATING_MODE', 'average').lower()
 SERIES_WATCH_MODE = os.getenv('SERIES_WATCH_MODE', 'full').lower()
 
 # Plex Community GraphQL API Endpoint
-PLEX_GRAPHQL_URL = "https://metadata.provider.plex.tv/library/arts"
+PLEX_GRAPHQL_URL = "https://metadata.provider.plex.tv/graphql"
 
 
 def get_plex_user_ratings(guid):
