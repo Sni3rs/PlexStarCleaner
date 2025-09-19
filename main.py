@@ -4,6 +4,7 @@ import schedule
 import time
 from datetime import datetime, timedelta, timezone
 from plexapi.server import PlexServer
+from plexapi.exceptions import NotFound
 
 # --- Environment Variables ---
 # Service Configurations
@@ -25,32 +26,37 @@ EXCLUDED_LIBRARIES_STR = os.getenv('EXCLUDED_LIBRARIES', '')
 EXCLUDED_LIBRARIES = [lib.strip().lower() for lib in EXCLUDED_LIBRARIES_STR.split(',') if lib.strip()]
 
 # Logic Mode Settings
-RATING_MODE = os.getenv('RATING_MODE', 'average').lower()
 SERIES_WATCH_MODE = os.getenv('SERIES_WATCH_MODE', 'full').lower()
 
 def get_plex_item_details(plex_server, rating_key):
     """
     Fetches the full media item from Plex to get its rating and all associated GUIDs.
+    Handles cases where the item is not found (deleted from Plex but still in Tautulli history).
     """
     try:
         item = plex_server.fetchItem(int(rating_key))
         rating = item.userRating if hasattr(item, 'userRating') else None
         
         db_id = None
-        # The guids attribute contains all external IDs (e.g., imdb, tmdb, tvdb)
+        db_type = None
         if hasattr(item, 'guids') and item.guids:
             for guid_obj in item.guids:
                 if 'tmdb' in guid_obj.id:
                     db_id = guid_obj.id.split('//')[1]
+                    db_type = 'movie'
                     break
                 elif 'tvdb' in guid_obj.id:
                     db_id = guid_obj.id.split('//')[1]
+                    db_type = 'series'
                     break
         
-        return rating, db_id
+        return rating, db_id, db_type
+    except NotFound:
+        print(f"Item with rating_key {rating_key} not found on Plex server. It may have been deleted.")
+        return None, None, None
     except Exception as e:
         print(f"Error fetching details for rating_key {rating_key} from Plex: {e}")
-        return None, None
+        return None, None, None
 
 def delete_radarr_movie(tmdb_id):
     """
@@ -130,16 +136,17 @@ def delete_sonarr_series(tvdb_id):
         print(f"Error communicating with Sonarr for TVDB ID {tvdb_id}: {e}")
         return False
 
-def process_media_item(plex_server, title, rating_key, media_type):
+def process_media_item(plex_server, title, rating_key):
     """
     Processes a single media item: fetches details, evaluates rating, and triggers deletion.
+    Returns a dictionary with action details if a deletion is triggered, otherwise None.
     """
-    print(f"\nProcessing {media_type.capitalize()}: {title} (Rating Key: {rating_key})")
+    print(f"\nProcessing: {title} (Rating Key: {rating_key})")
     
-    rating, db_id = get_plex_item_details(plex_server, rating_key)
+    rating, db_id, db_type = get_plex_item_details(plex_server, rating_key)
 
     if rating is None:
-        print("No personal rating found. Skipping.")
+        print("Skipping: No personal rating found or item is inaccessible.")
         return None
 
     print(f"Found personal rating: {rating}. Threshold is {RATING_THRESHOLD}.")
@@ -150,19 +157,18 @@ def process_media_item(plex_server, title, rating_key, media_type):
 
     print(f"Decision: DELETE (Rating {rating} is below threshold {RATING_THRESHOLD}).")
     
-    if not db_id:
-        print(f"Warning: Could not find a TMDB or TVDB ID for this item. Cannot proceed with deletion.")
+    if not db_id or not db_type:
+        print(f"Warning: Could not find a TMDB/TVDB ID. Cannot proceed with deletion.")
         return None
 
     delete_successful = False
-    if media_type == 'movie':
+    if db_type == 'movie':
         delete_successful = delete_radarr_movie(db_id)
-    elif media_type == 'series':
+    elif db_type == 'series':
         delete_successful = delete_sonarr_series(db_id)
     
-    # Only return the media type if the deletion command was successfully processed
     if delete_successful:
-        return media_type
+        return {'title': title, 'type': db_type, 'rating': rating}
     
     return None
 
@@ -170,15 +176,15 @@ def run_cleanup_job():
     """
     Main job function: Fetches watch history from Tautulli and processes eligible media.
     """
+    start_time = datetime.now()
     print("\n" + "="*80)
-    print(f"Starting PlexStarCleaner Job at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Starting PlexStarCleaner Job at {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Mode: {'DRY RUN' if DRY_RUN else 'LIVE DELETION'}")
     if EXCLUDED_LIBRARIES:
         print(f"Excluding libraries (case-insensitive): {', '.join(EXCLUDED_LIBRARIES)}")
     print("="*80 + "\n")
 
-    movies_flagged = 0
-    series_flagged = 0
+    actions_taken = []
     total_processed = 0
 
     required_vars = ['TAUTULLI_URL', 'TAUTULLI_API_KEY', 'PLEX_URL', 'PLEX_TOKEN']
@@ -214,7 +220,7 @@ def run_cleanup_job():
         if item.get('library_name', '').lower() in EXCLUDED_LIBRARIES:
             continue
 
-        if item.get('media_type') not in ['movie', 'episode'] or not item.get('guid'):
+        if item.get('media_type') not in ['movie', 'episode']:
             continue
         
         last_watched_date = datetime.fromtimestamp(item.get('date', 0), timezone.utc)
@@ -222,29 +228,24 @@ def run_cleanup_job():
         if last_watched_date > cutoff_date:
             continue
         
-        unique_id, title, media_type, rating_key = None, None, None, None
+        unique_id, title, rating_key = None, None, None
 
         if item['media_type'] == 'movie' and item.get('watched_status') == 1:
-            rating_key = item.get('rating_key')
+            unique_id = rating_key = item.get('rating_key')
             title = item.get('full_title')
-            media_type = 'movie'
-            unique_id = rating_key
 
         elif item['media_type'] == 'episode':
-            rating_key = item.get('grandparent_rating_key')
+            unique_id = rating_key = item.get('grandparent_rating_key')
             title = item.get('grandparent_title')
-            media_type = 'series'
-            unique_id = rating_key
             if SERIES_WATCH_MODE == 'full' and item.get('watched_status') != 1:
                 continue
 
-        if not all([unique_id, title, media_type, rating_key]):
+        if not all([unique_id, title, rating_key]):
             continue
             
         if unique_id not in media_to_process or last_watched_date > media_to_process[unique_id]['last_watched']:
             media_to_process[unique_id] = {
                 'title': title, 
-                'media_type': media_type, 
                 'rating_key': rating_key, 
                 'last_watched': last_watched_date
             }
@@ -260,13 +261,13 @@ def run_cleanup_job():
             result = process_media_item(
                 plex_server=plex_server,
                 title=media['title'], 
-                rating_key=media['rating_key'],
-                media_type=media['media_type']
+                rating_key=media['rating_key']
             )
-            if result == 'movie':
-                movies_flagged += 1
-            elif result == 'series':
-                series_flagged += 1
+            if result:
+                actions_taken.append(result)
+
+    movies_flagged = len([a for a in actions_taken if a['type'] == 'movie'])
+    series_flagged = len([a for a in actions_taken if a['type'] == 'series'])
     
     print("\n" + "="*80)
     print("PlexStarCleaner Job Finished")
@@ -275,10 +276,17 @@ def run_cleanup_job():
     print("S U M M A R Y")
     print("-" * 30)
     print(f"Total Unique Media Processed: {total_processed}")
-    action = "would have been deleted" if DRY_RUN else "were deleted"
-    print(f"Movies flagged for deletion: {movies_flagged}")
+    action_verb = "Flagged for deletion" if DRY_RUN else "Deleted"
+    
+    if actions_taken:
+        print(f"\n--- {action_verb} Media Details ---")
+        for action in actions_taken:
+            print(f"- {action['title']} ({action['type'].capitalize()}) - Rating: {action['rating']:.1f}")
+        print("-" * 30)
+
+    print(f"\nMovies flagged for deletion: {movies_flagged}")
     print(f"Series flagged for deletion: {series_flagged}")
-    print(f"Total items that {action}: {movies_flagged + series_flagged}")
+    print(f"Total items that {'would have been' if DRY_RUN else 'were'} deleted: {movies_flagged + series_flagged}")
     print("="*80)
 
 if __name__ == "__main__":
