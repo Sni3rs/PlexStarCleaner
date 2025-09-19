@@ -29,22 +29,20 @@ CRON_SCHEDULE = os.getenv('CRON_SCHEDULE', '02:00')
 EXCLUDED_LIBRARIES_STR = os.getenv('EXCLUDED_LIBRARIES', '')
 EXCLUDED_LIBRARIES = [lib.strip().lower() for lib in EXCLUDED_LIBRARIES_STR.split(',') if lib.strip()]
 
-
 def send_tautulli_notification(subject, body):
-    """Sends a notification through a configured Tautulli agent, respecting DRY_RUN."""
+    """Sends a notification through Tautulli. Appends [DRY RUN] to subject if active."""
     if not TAUTULLI_NOTIFIER_ID:
         return
-    if DRY_RUN:
-        print("DRY RUN: Skipping Tautulli notification.")
-        return
-        
-    print("Sending Tautulli notification...")
+
+    final_subject = f"[DRY RUN] {subject}" if DRY_RUN else subject
+    
+    print(f"Sending Tautulli notification{' (Dry Run)' if DRY_RUN else ''}...")
     try:
         params = {
             'apikey': TAUTULLI_API_KEY,
             'cmd': 'notify',
             'notifier_id': TAUTULLI_NOTIFIER_ID,
-            'subject': subject,
+            'subject': final_subject,
             'body': body
         }
         response = requests.post(f"{TAUTULLI_URL}/api/v2", params=params, timeout=20)
@@ -82,7 +80,7 @@ def evaluate_ratings(ratings):
     
     if RATING_MODE == 'any_high':
         if any(r >= RATING_THRESHOLD for r in ratings):
-            return False, f"Kept because at least one rating is >= {RATING_THRESHOLD}", average_rating
+            return False, f"Kept because one rating is >= {RATING_THRESHOLD}", average_rating
     
     if average_rating < RATING_THRESHOLD:
         return True, f"Eligible for deletion (Average Rating: {average_rating:.1f})", average_rating
@@ -94,21 +92,59 @@ def is_series_fully_watched(series_item):
     return hasattr(series_item, 'viewCount') and hasattr(series_item, 'leafCount') and series_item.viewCount >= series_item.leafCount
 
 def delete_radarr_movie(tmdb_id):
-    """Instructs Radarr to delete a movie."""
-    if not RADARR_URL or not RADARR_API_KEY: return False
+    """Instructs Radarr to delete a movie, respecting DRY_RUN."""
+    if not RADARR_URL or not RADARR_API_KEY:
+        print("Radarr not configured. Skipping deletion.")
+        return False
+
     try:
+        lookup_response = requests.get(f"{RADARR_URL}/api/v3/movie", params={'tmdbId': tmdb_id}, headers={'X-Api-Key': RADARR_API_KEY}, timeout=15)
+        lookup_response.raise_for_status()
+        movies = lookup_response.json()
+        if not movies:
+            print(f"Movie with TMDB ID {tmdb_id} not found in Radarr.")
+            return False
+        
+        radarr_id = movies[0]['id']
+        
+        if DRY_RUN:
+            print(f"DRY RUN: Would delete movie '{movies[0]['title']}' (Radarr ID: {radarr_id})")
+            return True
+
+        print(f"Instructing Radarr to delete movie '{movies[0]['title']}' (Radarr ID: {radarr_id})")
+        delete_response = requests.delete(f"{RADARR_URL}/api/v3/movie/{radarr_id}", params={'deleteFiles': 'true'}, headers={'X-Api-Key': RADARR_API_KEY}, timeout=30)
+        delete_response.raise_for_status()
         return True
     except requests.exceptions.RequestException as e:
-        print(f"Error communicating with Radarr: {e}")
+        print(f"Error communicating with Radarr for TMDB ID {tmdb_id}: {e}")
         return False
 
 def delete_sonarr_series(tvdb_id):
-    """Instructs Sonarr to delete a series."""
-    if not SONARR_URL or not SONARR_API_KEY: return False
+    """Instructs Sonarr to delete a series, respecting DRY_RUN."""
+    if not SONARR_URL or not SONARR_API_KEY:
+        print("Sonarr not configured. Skipping deletion.")
+        return False
+
     try:
+        lookup_response = requests.get(f"{SONARR_URL}/api/v3/series", params={'tvdbId': tvdb_id}, headers={'X-Api-Key': SONARR_API_KEY}, timeout=15)
+        lookup_response.raise_for_status()
+        series = lookup_response.json()
+        if not series:
+            print(f"Series with TVDB ID {tvdb_id} not found in Sonarr.")
+            return False
+            
+        sonarr_id = series[0]['id']
+        
+        if DRY_RUN:
+            print(f"DRY RUN: Would delete series '{series[0]['title']}' (Sonarr ID: {sonarr_id})")
+            return True
+
+        print(f"Instructing Sonarr to delete series '{series[0]['title']}' (Sonarr ID: {sonarr_id})")
+        delete_response = requests.delete(f"{SONARR_URL}/api/v3/series/{sonarr_id}", params={'deleteFiles': 'true'}, headers={'X-Api-Key': SONARR_API_KEY}, timeout=30)
+        delete_response.raise_for_status()
         return True
     except requests.exceptions.RequestException as e:
-        print(f"Error communicating with Sonarr: {e}")
+        print(f"Error communicating with Sonarr for TVDB ID {tvdb_id}: {e}")
         return False
 
 def run_cleanup_job():
@@ -119,7 +155,6 @@ def run_cleanup_job():
     # --- Service Connection ---
     try:
         plex_server = PlexServer(PLEX_URL, PLEX_TOKEN)
-        print("Successfully connected to Plex server.")
     except Exception as e:
         print(f"Fatal: Could not connect to Plex server. Aborting. Error: {e}")
         return
@@ -148,9 +183,10 @@ def run_cleanup_job():
         last_watched_date = datetime.fromtimestamp(item.get('date', 0), timezone.utc)
         
         if rating_key not in media_data:
-            media_data[rating_key] = {'ratings': [], 'users': set(), 'last_watched': last_watched_date, 'title': title, 'type': 'series' if item.get('media_type') == 'episode' else 'movie'}
+            media_data[rating_key] = {'ratings': [], 'users': set(), 'last_watched': last_watched_date, 'title': title}
         
         if user_rating is not None:
+            # Tautulli gives ratings on a 10-point scale.
             media_data[rating_key]['ratings'].append(float(user_rating))
         
         media_data[rating_key]['users'].add(user)
