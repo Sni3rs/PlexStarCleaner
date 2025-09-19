@@ -2,15 +2,23 @@ import os
 import requests
 import schedule
 import time
+import logging
 from datetime import datetime, timedelta, timezone
 from plexapi.server import PlexServer
 from plexapi.exceptions import NotFound
+from typing import List, Dict, Optional, Any
 
-# --- Environment Variables ---
-# Service Configurations
+# --- Configuration du Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+# --- Variables d'Environnement ---
+# Services
 TAUTULLI_URL = os.getenv('TAUTULLI_URL')
 TAUTULLI_API_KEY = os.getenv('TAUTULLI_API_KEY')
-TAUTULLI_NOTIFIER_ID = os.getenv('TAUTULLI_NOTIFIER_ID')
 RADARR_URL = os.getenv('RADARR_URL')
 RADARR_API_KEY = os.getenv('RADARR_API_KEY')
 SONARR_URL = os.getenv('SONARR_URL')
@@ -18,256 +26,287 @@ SONARR_API_KEY = os.getenv('SONARR_API_KEY')
 PLEX_URL = os.getenv('PLEX_URL')
 PLEX_TOKEN = os.getenv('PLEX_TOKEN')
 
-# Script Settings
+# Paramètres du script
 DRY_RUN = os.getenv('DRY_RUN', 'true').lower() == 'true'
-DAYS_DELAY_WARNING = int(os.getenv('DAYS_DELAY_WARNING', 30))
-DAYS_DELAY_DELETION = int(os.getenv('DAYS_DELAY_DELETION', 37))
+DAYS_DELAY = int(os.getenv('DAYS_DELAY', 30))
 RATING_THRESHOLD = float(os.getenv('RATING_THRESHOLD', 6.5))
-RATING_MODE = os.getenv('RATING_MODE', 'average').lower()
-SERIES_WATCH_MODE = os.getenv('SERIES_WATCH_MODE', 'full').lower()
 CRON_SCHEDULE = os.getenv('CRON_SCHEDULE', '02:00')
 EXCLUDED_LIBRARIES_STR = os.getenv('EXCLUDED_LIBRARIES', '')
 EXCLUDED_LIBRARIES = [lib.strip().lower() for lib in EXCLUDED_LIBRARIES_STR.split(',') if lib.strip()]
 
-def send_tautulli_notification(subject, body):
-    """Sends a notification through Tautulli. Appends [DRY RUN] to subject if active."""
-    if not TAUTULLI_NOTIFIER_ID:
-        return
+# Logique de traitement
+# NOTE: Le mode 'full' pour les séries est simplifié. Le script agira sur une série si
+# un de ses épisodes vus est plus ancien que DAYS_DELAY. Vérifier que la série
+# est *entièrement* vue est beaucoup plus complexe et coûteux en appels API.
+SERIES_WATCH_MODE = os.getenv('SERIES_WATCH_MODE', 'full').lower()
 
-    final_subject = f"[DRY RUN] {subject}" if DRY_RUN else subject
-    
-    print(f"Sending Tautulli notification{' (Dry Run)' if DRY_RUN else ''}...")
-    try:
-        params = {
-            'apikey': TAUTULLI_API_KEY,
-            'cmd': 'notify',
-            'notifier_id': TAUTULLI_NOTIFIER_ID,
-            'subject': final_subject,
-            'body': body
-        }
-        response = requests.post(f"{TAUTULLI_URL}/api/v2", params=params, timeout=20)
-        response.raise_for_status()
-        print("Tautulli notification sent successfully.")
-    except requests.exceptions.RequestException as e:
-        print(f"Error sending Tautulli notification: {e}")
 
-def get_plex_item_details(plex_server, rating_key):
-    """Fetches the full media item from Plex and its external database IDs."""
+def get_plex_item_details(plex_server: PlexServer, rating_key: str) -> (Optional[float], Optional[str]):
+    """
+    Récupère les détails d'un média depuis Plex via son rating_key.
+    Retourne la note personnelle et l'ID TMDB/TVDB.
+    """
     try:
         item = plex_server.fetchItem(int(rating_key))
-        db_id, db_type = None, None
+        rating = item.userRating if hasattr(item, 'userRating') else None
+        
+        db_id = None
         if hasattr(item, 'guids') and item.guids:
             for guid_obj in item.guids:
                 if 'tmdb' in guid_obj.id:
-                    db_id, db_type = guid_obj.id.split('//')[1], 'movie'
+                    db_id = guid_obj.id.split('//')[1]
                     break
                 elif 'tvdb' in guid_obj.id:
-                    db_id, db_type = guid_obj.id.split('//')[1], 'series'
+                    db_id = guid_obj.id.split('//')[1]
                     break
-        return item, db_id, db_type
+        
+        return rating, db_id
     except NotFound:
-        return None, None, None
+        logging.warning(f"Item avec rating_key {rating_key} non trouvé sur Plex. Il a peut-être déjà été supprimé.")
+        return None, None
     except Exception as e:
-        print(f"Error fetching Plex item {rating_key}: {e}")
-        return None, None, None
+        logging.error(f"Erreur lors de la récupération des détails pour rating_key {rating_key} depuis Plex: {e}")
+        return None, None
 
-def evaluate_ratings(ratings):
-    """Evaluates a list of ratings based on the configured RATING_MODE."""
-    if not ratings:
-        return False, "No user ratings found.", 0.0
-    
-    average_rating = sum(ratings) / len(ratings)
-    
-    if RATING_MODE == 'any_high':
-        if any(r >= RATING_THRESHOLD for r in ratings):
-            return False, f"Kept: one rating is >= {RATING_THRESHOLD}", average_rating
-    
-    if average_rating < RATING_THRESHOLD:
-        return True, f"Eligible: Average Rating ({average_rating:.1f}) is below {RATING_THRESHOLD}", average_rating
-    
-    return False, f"Kept: Average Rating ({average_rating:.1f}) is >= {RATING_THRESHOLD}", average_rating
 
-def is_series_fully_watched(series_item):
-    """Checks if a series has been fully watched."""
-    return hasattr(series_item, 'viewCount') and hasattr(series_item, 'leafCount') and series_item.viewCount >= series_item.leafCount
-
-def delete_radarr_movie(tmdb_id):
-    """Instructs Radarr to delete a movie, respecting DRY_RUN."""
+def delete_radarr_movie(tmdb_id: str) -> bool:
+    """
+    Ordonne à Radarr de supprimer un film via son ID TMDB.
+    """
     if not RADARR_URL or not RADARR_API_KEY:
-        print("Radarr not configured. Skipping deletion.")
+        logging.warning("Radarr n'est pas configuré. Suppression de film ignorée.")
         return False
-
+        
     try:
-        lookup_response = requests.get(f"{RADARR_URL}/api/v3/movie", params={'tmdbId': tmdb_id}, headers={'X-Api-Key': RADARR_API_KEY}, timeout=15)
+        # 1. Trouver le film dans Radarr par son TMDB ID
+        lookup_response = requests.get(
+            f"{RADARR_URL}/api/v3/movie",
+            params={'tmdbId': tmdb_id},
+            headers={'X-Api-Key': RADARR_API_KEY},
+            timeout=15
+        )
         lookup_response.raise_for_status()
         movies = lookup_response.json()
-        if not movies:
-            print(f"Movie with TMDB ID {tmdb_id} not found in Radarr.")
+        if not movies or 'id' not in movies[0]:
+            logging.info(f"Film avec TMDB ID {tmdb_id} non trouvé dans Radarr.")
             return False
-        
+
         radarr_id = movies[0]['id']
         
-        if DRY_RUN:
-            print(f"DRY RUN: Would delete movie '{movies[0]['title']}' (Radarr ID: {radarr_id})")
-            return True
-
-        print(f"Instructing Radarr to delete movie '{movies[0]['title']}' (Radarr ID: {radarr_id})")
-        delete_response = requests.delete(f"{RADARR_URL}/api/v3/movie/{radarr_id}", params={'deleteFiles': 'true', 'addImportExclusion': 'false'}, headers={'X-Api-Key': RADARR_API_KEY}, timeout=30)
-        delete_response.raise_for_status()
+        # 2. Envoyer la commande de suppression
+        logging.info(f"Commande de suppression à Radarr pour le film (Radarr ID: {radarr_id}, TMDB ID: {tmdb_id}).")
+        if not DRY_RUN:
+            delete_response = requests.delete(
+                f"{RADARR_URL}/api/v3/movie/{radarr_id}",
+                params={'deleteFiles': 'true', 'addImportExclusion': 'false'},
+                headers={'X-Api-Key': RADARR_API_KEY},
+                timeout=30
+            )
+            delete_response.raise_for_status()
+            logging.info("Commande de suppression envoyée avec succès à Radarr.")
         return True
+
     except requests.exceptions.RequestException as e:
-        print(f"Error communicating with Radarr for TMDB ID {tmdb_id}: {e}")
+        logging.error(f"Erreur de communication avec Radarr pour TMDB ID {tmdb_id}: {e}")
         return False
 
-def delete_sonarr_series(tvdb_id):
-    """Instructs Sonarr to delete a series, respecting DRY_RUN."""
+
+def delete_sonarr_series(tvdb_id: str) -> bool:
+    """
+    Ordonne à Sonarr de supprimer une série via son ID TVDB.
+    """
     if not SONARR_URL or not SONARR_API_KEY:
-        print("Sonarr not configured. Skipping deletion.")
+        logging.warning("Sonarr n'est pas configuré. Suppression de série ignorée.")
         return False
 
     try:
-        lookup_response = requests.get(f"{SONARR_URL}/api/v3/series", params={'tvdbId': tvdb_id}, headers={'X-Api-Key': SONARR_API_KEY}, timeout=15)
+        # 1. Trouver la série dans Sonarr par son TVDB ID
+        lookup_response = requests.get(
+            f"{SONARR_URL}/api/v3/series",
+            params={'tvdbId': tvdb_id},
+            headers={'X-Api-Key': SONARR_API_KEY},
+            timeout=15
+        )
         lookup_response.raise_for_status()
-        series = lookup_response.json()
-        if not series:
-            print(f"Series with TVDB ID {tvdb_id} not found in Sonarr.")
+        series_list = lookup_response.json()
+        if not series_list or 'id' not in series_list[0]:
+            logging.info(f"Série avec TVDB ID {tvdb_id} non trouvée dans Sonarr.")
             return False
-            
-        sonarr_id = series[0]['id']
-        
-        if DRY_RUN:
-            print(f"DRY RUN: Would delete series '{series[0]['title']}' (Sonarr ID: {sonarr_id})")
-            return True
 
-        print(f"Instructing Sonarr to delete series '{series[0]['title']}' (Sonarr ID: {sonarr_id})")
-        delete_response = requests.delete(f"{SONARR_URL}/api/v3/series/{sonarr_id}", params={'deleteFiles': 'true'}, headers={'X-Api-Key': SONARR_API_KEY}, timeout=30)
-        delete_response.raise_for_status()
+        sonarr_id = series_list[0]['id']
+        
+        # 2. Envoyer la commande de suppression
+        logging.info(f"Commande de suppression à Sonarr pour la série (Sonarr ID: {sonarr_id}, TVDB ID: {tvdb_id}).")
+        if not DRY_RUN:
+            delete_response = requests.delete(
+                f"{SONARR_URL}/api/v3/series/{sonarr_id}",
+                params={'deleteFiles': 'true'},
+                headers={'X-Api-Key': SONARR_API_KEY},
+                timeout=30
+            )
+            delete_response.raise_for_status()
+            logging.info("Commande de suppression envoyée avec succès à Sonarr.")
         return True
+            
     except requests.exceptions.RequestException as e:
-        print(f"Error communicating with Sonarr for TVDB ID {tvdb_id}: {e}")
+        logging.error(f"Erreur de communication avec Sonarr pour TVDB ID {tvdb_id}: {e}")
         return False
+
 
 def run_cleanup_job():
-    """Main job function to handle the entire warning and deletion process."""
-    print(f"\n{'='*80}\nStarting PlexStarCleaner Job at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Mode: {'DRY RUN' if DRY_RUN else 'LIVE DELETION'}")
+    """
+    Fonction principale du job.
+    """
+    logging.info("="*80)
+    logging.info(f"Démarrage du job PlexStarCleaner")
+    logging.info(f"Mode: {'DRY RUN' if DRY_RUN else 'LIVE DELETION'}")
+    if EXCLUDED_LIBRARIES:
+        logging.info(f"Bibliothèques exclues: {', '.join(EXCLUDED_LIBRARIES)}")
+    logging.info("="*80)
 
-    # --- Service Connection ---
+    # --- Vérification des variables d'environnement ---
+    required_vars = ['TAUTULLI_URL', 'TAUTULLI_API_KEY', 'PLEX_URL', 'PLEX_TOKEN']
+    if any(not globals().get(var) for var in required_vars):
+        logging.critical(f"Variables d'environnement manquantes: {[var for var in required_vars if not globals().get(var)]}. Arrêt.")
+        return
+
+    # --- Connexion à Plex ---
     try:
+        logging.info("Connexion au serveur Plex...")
         plex_server = PlexServer(PLEX_URL, PLEX_TOKEN)
+        logging.info("Connexion au serveur Plex réussie.")
     except Exception as e:
-        print(f"Fatal: Could not connect to Plex server. Aborting. Error: {e}"); return
+        logging.critical(f"Erreur de connexion au serveur Plex ({PLEX_URL}): {e}")
+        return
 
+    # --- Récupération de l'historique Tautulli ---
     try:
-        print("Fetching Tautulli history...")
-        params = {'apikey': TAUTULLI_API_KEY, 'cmd': 'get_history', 'length': 10000}
+        logging.info("Récupération de l'historique depuis Tautulli...")
+        params = {'apikey': TAUTULLI_API_KEY, 'cmd': 'get_history', 'length': 5000}
         response = requests.get(f"{TAUTULLI_URL}/api/v2", params=params, timeout=60)
         response.raise_for_status()
         history_data = response.json()['response']['data']['data']
-        print(f"Found {len(history_data)} items in Tautulli history.")
-    except Exception as e:
-        print(f"Fatal: Could not fetch Tautulli history. Aborting. Error: {e}"); return
+        logging.info(f"{len(history_data)} éléments d'historique récupérés.")
+    except requests.exceptions.RequestException as e:
+        logging.critical(f"Erreur lors de la récupération de l'historique Tautulli: {e}")
+        return
+    except (KeyError, TypeError):
+        logging.critical("Erreur de parsing de la réponse Tautulli. Vérifiez la clé API.")
+        return
 
-    # --- Data Aggregation from Tautulli ---
-    media_data = {}
+    # --- Traitement de l'historique ---
+    media_to_process: Dict[str, Dict[str, Any]] = {}
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=DAYS_DELAY)
+
     for item in history_data:
-        if item.get('library_name', '').lower() in EXCLUDED_LIBRARIES: continue
-        rating_key = item.get('grandparent_rating_key') if item.get('media_type') == 'episode' else item.get('rating_key')
-        title = item.get('grandparent_title') if item.get('media_type') == 'episode' else item.get('full_title')
-        user = item.get('friendly_name', 'Unknown')
-        user_rating = item.get('user_rating')
-        if not rating_key or not title: continue
+        if item.get('library_name', '').lower() in EXCLUDED_LIBRARIES:
+            continue
+        
+        media_type = item.get('media_type')
+        if media_type not in ['movie', 'episode']:
+            continue
+
         last_watched_date = datetime.fromtimestamp(item.get('date', 0), timezone.utc)
-        if rating_key not in media_data:
-            media_data[rating_key] = {'ratings': [], 'users': set(), 'last_watched': last_watched_date, 'title': title}
-        if user_rating is not None:
-            media_data[rating_key]['ratings'].append(float(user_rating))
-        media_data[rating_key]['users'].add(user)
-        if last_watched_date > media_data[rating_key]['last_watched']:
-            media_data[rating_key]['last_watched'] = last_watched_date
+        if last_watched_date > cutoff_date:
+            continue
+        
+        unique_id, title, rating_key = None, None, None
+
+        if media_type == 'movie' and item.get('watched_status') == 1:
+            rating_key = item.get('rating_key')
+            title = item.get('full_title')
+            unique_id = rating_key
+        elif media_type == 'episode':
+            # Pour une série, on utilise la clé du show (grandparent)
+            rating_key = item.get('grandparent_rating_key')
+            title = item.get('grandparent_title')
+            unique_id = rating_key
+
+        if not all([unique_id, title, rating_key]):
+            continue
+        
+        # On ne garde que la dernière date de visionnage pour chaque média unique
+        if unique_id not in media_to_process or last_watched_date > media_to_process[unique_id]['last_watched']:
+            media_to_process[unique_id] = {
+                'title': title, 
+                'media_type': 'series' if media_type == 'episode' else 'movie',
+                'rating_key': rating_key, 
+                'last_watched': last_watched_date
+            }
     
-    print(f"Aggregated history into {len(media_data)} unique media items. Now processing...")
+    # --- Évaluation et suppression ---
+    if not media_to_process:
+        logging.info("Aucun média éligible à traiter.")
+    else:
+        logging.info(f"{len(media_to_process)} médias uniques éligibles pour évaluation.")
+        sorted_media = sorted(media_to_process.values(), key=lambda x: x['last_watched'])
+        
+        results = {'deleted': [], 'kept': [], 'failed': []}
 
-    # --- Processing Logic ---
-    items_for_warning, items_for_deletion = [], []
-    now = datetime.now(timezone.utc)
-    warning_start = now - timedelta(days=DAYS_DELAY_DELETION)
-    warning_end = now - timedelta(days=DAYS_DELAY_WARNING)
-    deletion_cutoff = now - timedelta(days=DAYS_DELAY_DELETION)
+        for media in sorted_media:
+            title = media['title']
+            logging.info(f"--- Traitement de: {title} ({media['media_type']}) ---")
+            
+            rating, db_id = get_plex_item_details(plex_server, media['rating_key'])
 
-    for i, (key, data) in enumerate(media_data.items()):
-        print(f"\n[{i+1}/{len(media_data)}] Processing '{data['title']}'")
-        last_watched_ago = (now - data['last_watched']).days
-        print(f"  - Last watched: {last_watched_ago} days ago.")
+            if rating is None:
+                logging.info("Pas de note personnelle trouvée. Conservation.")
+                results['kept'].append(title)
+                continue
 
-        if last_watched_ago < DAYS_DELAY_WARNING:
-            print(f"  - SKIP: Watched too recently.")
-            continue
+            logging.info(f"Note personnelle trouvée: {rating}. Seuil: {RATING_THRESHOLD}.")
 
-        plex_item, db_id, db_type = get_plex_item_details(plex_server, key)
-        if not plex_item:
-            print("  - SKIP: Item not found on Plex server.")
-            continue
+            if rating >= RATING_THRESHOLD:
+                logging.info(f"DÉCISION: CONSERVER (note {rating} >= {RATING_THRESHOLD}).")
+                results['kept'].append(title)
+                continue
 
-        should_delete, reason, avg_rating = evaluate_ratings(data['ratings'])
-        print(f"  - Ratings: {data['ratings'] if data['ratings'] else 'None'}. Evaluation: {reason}")
-        if not should_delete:
-            continue
+            logging.info(f"DÉCISION: SUPPRIMER (note {rating} < {RATING_THRESHOLD}).")
+            
+            if not db_id:
+                logging.warning(f"Impossible de trouver un ID TMDB/TVDB pour '{title}'. Suppression annulée.")
+                results['failed'].append(title)
+                continue
 
-        if db_type == 'series' and SERIES_WATCH_MODE == 'full' and not is_series_fully_watched(plex_item):
-            print(f"  - SKIP: Series not fully watched (mode: full).")
-            continue
+            delete_successful = False
+            if media['media_type'] == 'movie':
+                delete_successful = delete_radarr_movie(db_id)
+            elif media['media_type'] == 'series':
+                delete_successful = delete_sonarr_series(db_id)
+            
+            if delete_successful:
+                results['deleted'].append(title)
+            else:
+                results['failed'].append(title)
 
-        if warning_start < data['last_watched'] <= warning_end:
-            print(f"  - QUALIFIES FOR WARNING.")
-            items_for_warning.append({'title': data['title'], 'avg_rating': avg_rating, 'users': data['users']})
-        elif data['last_watched'] < deletion_cutoff:
-            print(f"  - QUALIFIES FOR DELETION.")
-            items_for_deletion.append({'db_id': db_id, 'db_type': db_type, 'title': data['title'], 'avg_rating': avg_rating})
+    # --- Résumé Final ---
+    logging.info("="*80)
+    logging.info("Job PlexStarCleaner Terminé")
+    action = "seraient supprimés" if DRY_RUN else "ont été supprimés"
+    
+    logging.info(f"\n--- RÉSUMÉ ({'DRY RUN' if DRY_RUN else 'LIVE'}) ---\n")
+    logging.info(f"Total de médias uniques traités: {len(media_to_process)}")
+    logging.info(f"Médias conservés (note suffisante ou pas de note): {len(results['kept'])}")
+    logging.info(f"Échecs de suppression (ID non trouvé, erreur API): {len(results['failed'])}")
+    logging.info(f"Total de médias qui {action}: {len(results['deleted'])}")
+    
+    if results['deleted']:
+        logging.info("\nListe des médias supprimés :")
+        for title in results['deleted']:
+            logging.info(f"  - {title}")
+            
+    if results['failed']:
+        logging.info("\nListe des échecs :")
+        for title in results['failed']:
+            logging.info(f"  - {title}")
 
-    # --- Actions and Notifications ---
-    if items_for_warning:
-        subject = f"Plex Deletion Warning: {len(items_for_warning)} Item(s)"
-        body = f"<b>The following media have a low rating and are scheduled for deletion in ~7 days:</b>\n"
-        for item_data in items_for_warning:
-            user_list = ", ".join(sorted(list(item_data['users'])))
-            body += f"- <b>{item_data['title']}</b> (Avg Rating: {item_data['avg_rating']:.1f}, Watched by: {user_list})\n"
-        print("\n--- WARNING SUMMARY ---")
-        print(body.replace('<b>', '').replace('</b>', ''))
-        send_tautulli_notification(subject, body)
+    logging.info("="*80)
 
-    actions_taken = []
-    if items_for_deletion:
-        print("\n--- PROCESSING DELETIONS ---")
-        for item_data in items_for_deletion:
-            deleted = False
-            if item_data['db_type'] == 'movie':
-                deleted = delete_radarr_movie(item_data['db_id'])
-            elif item_data['db_type'] == 'series':
-                deleted = delete_sonarr_series(item_data['db_id'])
-            if deleted: actions_taken.append(item_data)
-
-    if actions_taken:
-        action_verb = "Flagged for Deletion" if DRY_RUN else "Deleted"
-        subject = f"PlexStarCleaner Report: {len(actions_taken)} Item(s) {action_verb}"
-        body = f"<b>A total of {len(actions_taken)} media item(s) were {'flagged for deletion' if DRY_RUN else 'deleted'}:</b>\n"
-        for action in actions_taken:
-            body += f"- <b>{action['title']}</b> ({action['db_type'].capitalize()}) - Avg Rating: {action['avg_rating']:.1f}\n"
-        print("\n--- DELETION SUMMARY ---")
-        print(body.replace('<b>', '').replace('</b>', ''))
-        send_tautulli_notification(subject, body)
-
-    if not items_for_warning and not actions_taken:
-        print("\nNo items matched the criteria for warning or deletion.")
-
-    print(f"\nJob finished at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{'='*80}")
 
 if __name__ == "__main__":
-    if DAYS_DELAY_WARNING >= DAYS_DELAY_DELETION:
-        raise ValueError("FATAL: DAYS_DELAY_DELETION must be greater than DAYS_DELAY_WARNING.")
     run_cleanup_job()
     schedule.every().day.at(CRON_SCHEDULE).do(run_cleanup_job)
-    print(f"Scheduling job to run every day at {CRON_SCHEDULE}. Waiting...")
+    logging.info(f"Planification du job chaque jour à {CRON_SCHEDULE}. En attente...")
     while True:
         schedule.run_pending()
         time.sleep(60)
