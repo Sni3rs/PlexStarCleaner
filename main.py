@@ -25,23 +25,32 @@ EXCLUDED_LIBRARIES_STR = os.getenv('EXCLUDED_LIBRARIES', '')
 EXCLUDED_LIBRARIES = [lib.strip().lower() for lib in EXCLUDED_LIBRARIES_STR.split(',') if lib.strip()]
 
 # Logic Mode Settings
-# Note: RATING_MODE is kept for compatibility, but now only reflects the owner's rating.
-# 'average' and 'any_high' will behave identically as we fetch a single rating.
 RATING_MODE = os.getenv('RATING_MODE', 'average').lower()
 SERIES_WATCH_MODE = os.getenv('SERIES_WATCH_MODE', 'full').lower()
 
-
-def get_owner_rating(plex_server, rating_key):
+def get_plex_item_details(plex_server, rating_key):
     """
-    Fetches the personal rating for a media item from the Plex server.
+    Fetches the full media item from Plex to get its rating and all associated GUIDs.
     """
     try:
         item = plex_server.fetchItem(int(rating_key))
-        # userRating is on a 10-point scale
-        return item.userRating if hasattr(item, 'userRating') else None
+        rating = item.userRating if hasattr(item, 'userRating') else None
+        
+        db_id = None
+        # The guids attribute contains all external IDs (e.g., imdb, tmdb, tvdb)
+        if hasattr(item, 'guids') and item.guids:
+            for guid_obj in item.guids:
+                if 'tmdb' in guid_obj.id:
+                    db_id = guid_obj.id.split('//')[1]
+                    break
+                elif 'tvdb' in guid_obj.id:
+                    db_id = guid_obj.id.split('//')[1]
+                    break
+        
+        return rating, db_id
     except Exception as e:
-        print(f"Error fetching rating for rating_key {rating_key} from Plex: {e}")
-        return None
+        print(f"Error fetching details for rating_key {rating_key} from Plex: {e}")
+        return None, None
 
 def delete_radarr_movie(tmdb_id):
     """
@@ -49,10 +58,9 @@ def delete_radarr_movie(tmdb_id):
     """
     if not RADARR_URL or not RADARR_API_KEY:
         print("Radarr URL or API Key is not configured. Skipping movie deletion.")
-        return
+        return False
         
     try:
-        # Radarr's API uses tmdbId as a query param, not part of the path
         lookup_response = requests.get(
             f"{RADARR_URL}/api/v3/movie",
             params={'tmdbId': tmdb_id},
@@ -63,7 +71,7 @@ def delete_radarr_movie(tmdb_id):
         movies = lookup_response.json()
         if not movies:
             print(f"Movie with TMDB ID {tmdb_id} not found in Radarr.")
-            return
+            return False
 
         radarr_id = movies[0]['id']
         
@@ -77,9 +85,11 @@ def delete_radarr_movie(tmdb_id):
             )
             delete_response.raise_for_status()
             print("Deletion command sent to Radarr successfully.")
+        return True
 
     except requests.exceptions.RequestException as e:
         print(f"Error communicating with Radarr for TMDB ID {tmdb_id}: {e}")
+        return False
 
 def delete_sonarr_series(tvdb_id):
     """
@@ -87,10 +97,9 @@ def delete_sonarr_series(tvdb_id):
     """
     if not SONARR_URL or not SONARR_API_KEY:
         print("Sonarr URL or API Key is not configured. Skipping series deletion.")
-        return
+        return False
 
     try:
-        # Sonarr's API uses tvdbId as a query param
         lookup_response = requests.get(
             f"{SONARR_URL}/api/v3/series",
             params={'tvdbId': tvdb_id},
@@ -101,7 +110,7 @@ def delete_sonarr_series(tvdb_id):
         series = lookup_response.json()
         if not series:
             print(f"Series with TVDB ID {tvdb_id} not found in Sonarr.")
-            return
+            return False
 
         sonarr_id = series[0]['id']
 
@@ -115,18 +124,19 @@ def delete_sonarr_series(tvdb_id):
             )
             delete_response.raise_for_status()
             print("Deletion command sent to Sonarr successfully.")
+        return True
             
     except requests.exceptions.RequestException as e:
         print(f"Error communicating with Sonarr for TVDB ID {tvdb_id}: {e}")
+        return False
 
-def process_media_item(plex_server, title, guid, rating_key, media_type):
+def process_media_item(plex_server, title, rating_key, media_type):
     """
-    Processes a single media item: fetches rating, evaluates it, and triggers deletion if criteria are met.
-    Returns the media type ('movie' or 'series') if flagged for deletion, otherwise None.
+    Processes a single media item: fetches details, evaluates rating, and triggers deletion.
     """
     print(f"\nProcessing {media_type.capitalize()}: {title} (Rating Key: {rating_key})")
     
-    rating = get_owner_rating(plex_server, rating_key)
+    rating, db_id = get_plex_item_details(plex_server, rating_key)
 
     if rating is None:
         print("No personal rating found. Skipping.")
@@ -134,29 +144,25 @@ def process_media_item(plex_server, title, guid, rating_key, media_type):
 
     print(f"Found personal rating: {rating}. Threshold is {RATING_THRESHOLD}.")
 
-    should_delete = False
-    if rating < RATING_THRESHOLD:
-        should_delete = True
-        print(f"Decision: DELETE (Rating {rating} is below threshold {RATING_THRESHOLD}).")
-    else:
+    if rating >= RATING_THRESHOLD:
         print(f"Decision: KEEP (Rating {rating} is at or above threshold {RATING_THRESHOLD}).")
+        return None
+
+    print(f"Decision: DELETE (Rating {rating} is below threshold {RATING_THRESHOLD}).")
     
-    if should_delete:
-        try:
-            # For deletion, we need the DB-specific ID from the GUID (e.g., tmdb, tvdb)
-            if 'tvdb' in guid:
-                db_id = guid.split('//')[-1].split('?')[0]
-                delete_sonarr_series(db_id)
-            elif 'tmdb' in guid:
-                db_id = guid.split('//')[-1].split('?')[0]
-                delete_radarr_movie(db_id)
-            else:
-                 print(f"Warning: Could not determine service (Sonarr/Radarr) from GUID: {guid}")
-                 return None
-            
-            return media_type # Return type if deletion was triggered
-        except IndexError:
-            print(f"Error: Could not parse database ID from GUID: {guid}")
+    if not db_id:
+        print(f"Warning: Could not find a TMDB or TVDB ID for this item. Cannot proceed with deletion.")
+        return None
+
+    delete_successful = False
+    if media_type == 'movie':
+        delete_successful = delete_radarr_movie(db_id)
+    elif media_type == 'series':
+        delete_successful = delete_sonarr_series(db_id)
+    
+    # Only return the media type if the deletion command was successfully processed
+    if delete_successful:
+        return media_type
     
     return None
 
@@ -216,38 +222,28 @@ def run_cleanup_job():
         if last_watched_date > cutoff_date:
             continue
         
-        # Use a unique key for each item
-        unique_id, title, media_type, guid, rating_key = None, None, None, None, None
+        unique_id, title, media_type, rating_key = None, None, None, None
 
         if item['media_type'] == 'movie' and item.get('watched_status') == 1:
             rating_key = item.get('rating_key')
             title = item.get('full_title')
             media_type = 'movie'
-            guid = item.get('guid')
             unique_id = rating_key
 
         elif item['media_type'] == 'episode':
-            # For series, we act on the show level
             rating_key = item.get('grandparent_rating_key')
             title = item.get('grandparent_title')
             media_type = 'series'
-            guid = item.get('grandparent_guid')
             unique_id = rating_key
-            # Ensure series is fully watched if mode is 'full'
             if SERIES_WATCH_MODE == 'full' and item.get('watched_status') != 1:
-                # This logic is imperfect as it only checks the last watched episode.
-                # A more robust solution would check the series' watched status in Plex,
-                # but this maintains original script behavior for simplicity.
                 continue
 
-        if not all([unique_id, title, media_type, guid, rating_key]):
+        if not all([unique_id, title, media_type, rating_key]):
             continue
             
-        # Store the most recently watched item's data
         if unique_id not in media_to_process or last_watched_date > media_to_process[unique_id]['last_watched']:
             media_to_process[unique_id] = {
                 'title': title, 
-                'guid': guid, 
                 'media_type': media_type, 
                 'rating_key': rating_key, 
                 'last_watched': last_watched_date
@@ -257,7 +253,6 @@ def run_cleanup_job():
         print("No eligible media items found to process.")
     else:
         print(f"Found {len(media_to_process)} unique media items eligible for processing.")
-        # Sort by last watched date to process oldest first
         sorted_media = sorted(media_to_process.values(), key=lambda x: x['last_watched'])
         total_processed = len(sorted_media)
         
@@ -265,7 +260,6 @@ def run_cleanup_job():
             result = process_media_item(
                 plex_server=plex_server,
                 title=media['title'], 
-                guid=media['guid'], 
                 rating_key=media['rating_key'],
                 media_type=media['media_type']
             )
@@ -286,7 +280,6 @@ def run_cleanup_job():
     print(f"Series flagged for deletion: {series_flagged}")
     print(f"Total items that {action}: {movies_flagged + series_flagged}")
     print("="*80)
-
 
 if __name__ == "__main__":
     run_cleanup_job()
